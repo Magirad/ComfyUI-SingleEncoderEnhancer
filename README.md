@@ -41,6 +41,8 @@ Restart ComfyUI, then refresh the browser.
   - With a **System prompt** connected (for example Bria's VGL prompt for Fibo 2), JSON mode sends exactly Generate
     Text's request and accepts any JSON object, with its own keys and image tags; the built-in fields above are not
     required.
+  - Before any retry, a missing comma, a trailing comma or missing closing brackets at the end are repaired, so a
+    small slip in a long caption does not cost a second generation.
 
 ## Images and edits
 - **Image sockets:** connect pictures to the image sockets; a new socket appears each time the last one is used.

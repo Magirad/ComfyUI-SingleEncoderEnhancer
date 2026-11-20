@@ -283,6 +283,10 @@ broken = '{"short_description": "x", "objects": [{"description": "a man"}] "ligh
 clip = Replies([broken, reply])
 prompt, *_ = Node.execute(clip, "a man", mode="json", system_prompt=vgl, **common).args
 assert json.loads(prompt) == json.loads(reply) and clip.generated == 2   # retried; the nested {"description"} is not taken
+# a missing final brace (seen in real VGL answers) is repaired without a second generation
+clip = Replies(['{"short_description": "a man",\n  "edit_instruction": "Put the coat on him."'])
+prompt, *_ = Node.execute(clip, "a man", mode="json", system_prompt=vgl, **common).args
+assert json.loads(prompt) == {"short_description": "a man", "edit_instruction": "Put the coat on him."} and clip.generated == 1
 clip = Replies(["no json here", "still none"])
 try:
     Node.execute(clip, "a red cube", mode="json", system_prompt=vgl, **common)

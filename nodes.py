@@ -141,8 +141,29 @@ def matched_attention_dtypes():
         comfy.ops.scaled_dot_product_attention = original
 
 
+def repair_json(text):
+    # The slips LLMs make in long JSON: a missing comma at a line end before the next value, a trailing comma before a
+    # closing bracket, and closing brackets left off at the end. A raw newline cannot occur inside a JSON string, so a
+    # line that starts with a quote, brace or bracket is always outside a string and the comma insertion cannot touch
+    # string content; the closers are found by a scan that skips strings.
+    text = re.sub(r'("|\d|\]|\}|true|false|null)([ \t]*\r?\n\s*)(["{\[])', r"\1,\2\3", text.rstrip())
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    stack, in_string, escaped = [], False, False
+    for char in text:
+        if in_string:
+            escaped, in_string = (not escaped and char == "\\"), in_string and (escaped or char != '"')
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]" and stack:
+            stack.pop()
+    return text if in_string else text.rstrip(",") + "".join(reversed(stack))
+
+
 def outer_json_object(raw):
-    # The answer's outermost JSON object only: a broken object is an error, never replaced by one of its nested parts.
+    # The answer's outermost JSON object only: a broken object is repaired if it has the two common slips (missing or
+    # trailing comma), otherwise it is an error; it is never replaced by one of its nested parts.
     text = raw.partition("</think>")[-1] if "</think>" in raw else raw
     if text.lstrip().startswith("<think>"):
         raise ValueError("unfinished reasoning")
@@ -153,7 +174,12 @@ def outer_json_object(raw):
     try:
         value = json.JSONDecoder().raw_decode(text[start:])[0]
     except json.JSONDecodeError as problem:
-        raise ValueError(f"invalid JSON ({problem.msg} at character {problem.pos})") from None
+        try:
+            value = json.JSONDecoder().raw_decode(repair_json(text[start:]))[0]
+            logging.info("Single Encoder Enhancer JSON: repaired a missing or extra comma (%s at character %d); "
+                         "no regeneration needed.", problem.msg, problem.pos)
+        except json.JSONDecodeError:
+            raise ValueError(f"invalid JSON ({problem.msg} at character {problem.pos})") from None
     if not isinstance(value, dict) or not value:
         raise ValueError("no JSON object")
     return value

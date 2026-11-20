@@ -1,6 +1,7 @@
 """Mock check of the three modes on CPU. Run with ComfyUI's Python."""
 
 import importlib
+import json
 import math
 from pathlib import Path
 import sys
@@ -267,15 +268,27 @@ clip = Clip("unused")
 Node.execute(clip, "a red cube", mode="normal", keep_model_loaded=True, resolution=64, force_rewrite=True)
 assert clip.encoded == ["a red cube"]
 
-# JSON mode with a connected system prompt that asks for prose: it stays a content guide, the format stays JSON
-style = "You are a poet. Answer in flowing prose paragraphs only. Favor warm colors."
-clip = Replies(['A warm red cube glows softly.', '{"description": "a warm red cube", "style": "warm palette"}'])
-prompt, *_ = Node.execute(clip, "a red cube", mode="json", system_prompt=style, **common).args
-asked = clip.calls[0][0]
-assert style in asked and node_module.JSON_T2I_PROMPT in asked and "ignore any output format it asks for" in asked
-assert asked.rindex("[REQUIRED_OUTPUT") > asked.index(style)              # the format comes last and wins
-assert prompt == '{"description":"a warm red cube","style":"warm palette"}' and clip.generated == 2
-assert any(style in text and "not usable" in text for text, _ in clip.calls)   # the retry keeps the guide
+# JSON mode with a connected system prompt (e.g. Bria's VGL prompt): Generate Text's request, any JSON object passes
+# with its own keys and image tags; a non-JSON answer gets one retry, then the node stops
+vgl = "You are a Creative Director. Answer with a VGL JSON caption."
+reply = '{"short_description": "a man in a yellow raincoat", "objects": [], "edit_instruction": "Put the coat from <image_2> on him."}'
+clip = Replies(['A man in a raincoat.', reply])
+prompt, *_ = Node.execute(clip, "put the coat from <image_2> on the man in <image_1>", mode="json", system_prompt=vgl,
+                          images={"image_1": image, "image_2": image}, repetition_penalty=1.05, **common).args
+text, kwargs = clip.calls[0]
+assert text == "put the coat from <image_2> on the man in <image_1>" and kwargs["system_prompt"] == vgl
+assert json.loads(prompt) == json.loads(reply) and "<image_2>" in prompt and clip.generated == 2
+assert any("not usable" in c[0] and c[1].get("system_prompt") == vgl for c in clip.calls)   # the retry keeps the prompt
+broken = '{"short_description": "x", "objects": [{"description": "a man"}] "lighting": {}}'   # missing comma
+clip = Replies([broken, reply])
+prompt, *_ = Node.execute(clip, "a man", mode="json", system_prompt=vgl, **common).args
+assert json.loads(prompt) == json.loads(reply) and clip.generated == 2   # retried; the nested {"description"} is not taken
+clip = Replies(["no json here", "still none"])
+try:
+    Node.execute(clip, "a red cube", mode="json", system_prompt=vgl, **common)
+    raise SystemExit("FAIL: JSON with a system prompt encoded a non-JSON answer")
+except ValueError as error:
+    assert "after one retry" in str(error) and not clip.encoded
 
 # Enhance given a JSON answer builds prose from its fields instead of failing; JSON is never encoded in Enhance
 clip = Replies(['{"edit_instruction": "Put the red coat from <image2> on the woman in <image1>", '

@@ -141,6 +141,24 @@ def matched_attention_dtypes():
         comfy.ops.scaled_dot_product_attention = original
 
 
+def outer_json_object(raw):
+    # The answer's outermost JSON object only: a broken object is an error, never replaced by one of its nested parts.
+    text = raw.partition("</think>")[-1] if "</think>" in raw else raw
+    if text.lstrip().startswith("<think>"):
+        raise ValueError("unfinished reasoning")
+    text = re.sub(r"```(?:json)?", "", text)
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object")
+    try:
+        value = json.JSONDecoder().raw_decode(text[start:])[0]
+    except json.JSONDecodeError as problem:
+        raise ValueError(f"invalid JSON ({problem.msg} at character {problem.pos})") from None
+    if not isinstance(value, dict) or not value:
+        raise ValueError("no JSON object")
+    return value
+
+
 def json_object(raw, required=()):
     # The first JSON object in the reply that has the required keys; reasoning and Markdown fences are skipped.
     text = raw.partition("</think>")[-1] if "</think>" in raw else raw
@@ -455,10 +473,26 @@ def plan(clip, instruction, vision, mode, system_prompt, negative_prompt, option
                                       request, vision, options, original_instruction=request, negative_prompt=negative_prompt,
                                       enhance_length=enhance_length, chat=chat), True)
     edit = bool(vision)
-    # A connected system prompt is kept as the content guide, next to the built-in field guidance; the JSON shape
-    # still comes from the contract and is checked below, so a prose-asking prompt cannot change the output format.
+    if system_prompt.strip():
+        # A connected system prompt (e.g. Bria's VGL prompt) defines the JSON: the request is exactly Generate Text's,
+        # any JSON object is accepted and passed on with the model's own keys and image tags.
+        thinking = bool(chat and chat.get("thinking"))
+        task = instruction
+        for attempt in range(2):
+            raw = generate_like_textgen(clip, system_prompt.strip(), task, vision, options, thinking)
+            try:
+                caption = outer_json_object(raw)
+                return raw, json.dumps(caption, ensure_ascii=False, separators=(",", ":"), allow_nan=False), True
+            except ValueError as error:
+                if attempt:
+                    raise ValueError(f"JSON mode could not produce a JSON object after one retry: {error}. "
+                                     "See raw_output; raise Max tokens if the object was cut off. Nothing was encoded.") from error
+                logging.warning("Single Encoder Enhancer JSON: %s. Retrying once with the error.", error)
+                task = (instruction + f"\n\nYour previous answer was not usable ({error}). Answer again with exactly "
+                        "one complete JSON object and nothing else.")
+    # Built-in schema: field guidance plus a contract with an example object; the required keys are checked below.
     built_in = JSON_EDIT_PROMPT if edit else JSON_T2I_PROMPT
-    guidance = (system_prompt.strip() + "\n\n" + built_in) if system_prompt.strip() else built_in
+    guidance = built_in
     contract = JSON_EDIT_CONTRACT if edit else JSON_T2I_CONTRACT
     task = request
     for attempt in range(2):
@@ -571,7 +605,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
                 io.Boolean.Input("thinking", display_name="Thinking", default=False,
                                  tooltip="Ask the model to reason before it writes, like Generate Text's thinking option. Works only on models whose chat template supports it; others ignore it. Much slower. The reasoning appears in raw_output and is not encoded; set Max tokens high enough for reasoning + answer."),
                 io.String.Input("system_prompt", display_name="System prompt", optional=True, force_input=True,
-                                tooltip="Optional: replaces the built-in rewrite guidance. Enhance: sent as the system prompt, exactly as Generate Text sends its system prompt. JSON: kept as the content guide; the node still adds its JSON field rules, so a prompt asking for another format cannot break the encode. Empty = built-in guidance."),
+                                tooltip="Optional: replaces the built-in rewrite guidance. Enhance: sent as the system prompt, exactly as Generate Text sends its system prompt. JSON: also sent as the system prompt exactly as Generate Text does (e.g. Bria's VGL prompt for Fibo 2); any JSON object it produces is encoded with its own keys, one retry if the answer is not JSON. Empty = built-in guidance and the built-in JSON fields."),
                 io.Boolean.Input("force_rewrite", display_name="Force rewrite", default=False,
                                  tooltip="Off: an unchanged request (same writer, texts, pictures and settings) reuses its stored rewrite, so nothing is generated again. On: do all the work again on every run, also when nothing changed: a fresh rewrite, a fresh encode and fresh image features (nothing is reused from earlier runs). Use it for timing tests. With Sampling off the fresh rewrite is the same text."),
                 io.Combo.Input("encode_negative", display_name="Encode negative", options=["on", "auto", "off"], default="auto",
@@ -645,7 +679,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
                 options = dict(do_sample=do_sample, max_length=max_length, temperature=temperature, top_k=top_k,
                                top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty,
                                presence_penalty=presence_penalty, seed=seed)
-                if mode == "json":   # JSON repeats quotes, colons and braces by design: penalties would break its syntax
+                if mode == "json" and not system_prompt.strip():   # built-in schema: penalties would break its syntax
                     options.update(repetition_penalty=1.0, presence_penalty=0.0)
                 # an unchanged request is not written again: same writer, texts, pictures and settings -> stored rewrite
                 key = rewrite_key(author, mode, instruction, system_prompt, negative_prompt,

@@ -38,6 +38,9 @@ Restart ComfyUI, then refresh the browser.
   - Text-to-image fields: `description`, `subjects`, `background`, `composition`, `lighting`, `style`, `rendered_text`.
   - If the answer is not a valid object with the required keys, the node retries once. If the retry also fails, the
     node stops with an error and encodes nothing.
+  - With a **System prompt** connected (for example Bria's VGL prompt for Fibo 2), JSON mode sends exactly Generate
+    Text's request and accepts any JSON object, with its own keys and image tags; the built-in fields above are not
+    required.
 
 ## Images and edits
 - **Image sockets:** connect pictures to the image sockets; a new socket appears each time the last one is used.

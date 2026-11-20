@@ -1,6 +1,7 @@
 """Mock check of the three modes on CPU. Run with ComfyUI's Python."""
 
 import importlib
+import math
 from pathlib import Path
 import sys
 
@@ -75,7 +76,9 @@ clip = Clip("A glossy red cube rests on a pale wooden table under soft morning l
 prompt, *_ = Node.execute(clip, "a red cube", mode="enhance", **common).args
 assert prompt.startswith("A glossy red cube") and clip.encoded[0] == prompt
 kwargs = clip.calls[0][1]
-assert "[GUIDANCE" in clip.calls[0][0] and "system_prompt" not in kwargs and kwargs["skip_template"] is False and kwargs["images"] == [] and kwargs["thinking"] is False
+# Enhance sends Generate Text's request: the instruction alone as the user turn, the guidance as the system prompt
+assert clip.calls[0][0] == "a red cube" and kwargs["system_prompt"] == node_module.T2I_SYSTEM_PROMPT
+assert kwargs["skip_template"] is False and kwargs["images"] == [] and kwargs["thinking"] is False and kwargs["min_length"] == 1
 
 clip = Clip('{"description": "red cube", "style": "photo"}')
 prompt, *_ = Node.execute(clip, "a red cube", mode="json", **common).args
@@ -113,7 +116,7 @@ assert prompt == "a red cube" and raw.startswith("[Single Encoder Enhancer] Enha
 # truncated main CLIP + refiner: the refiner writes, the main CLIP encodes the rewrite
 main, refiner = Clip("unused", model=TruncatedModel), Clip(reply)
 prompt, *_ = Node.execute(main, "a red cube", mode="enhance", refiner_clip=refiner, **common).args
-assert prompt == reply and main.encoded[0] == reply and not refiner.encoded and "[GUIDANCE" in refiner.calls[0][0]
+assert prompt == reply and main.encoded[0] == reply and not refiner.encoded and "system_prompt" in refiner.calls[0][1]
 
 # able main CLIP + refiner, Writer auto: the main CLIP writes and the refiner is never loaded
 main, refiner = Clip(reply), Clip("unused")
@@ -123,7 +126,7 @@ assert prompt == reply and not refiner.calls and main.encoded[0] == reply
 # writer choice: main keeps the refiner idle; refiner/auto use it; a choice that cannot write falls to the other
 main, refiner = Clip(reply), Clip("unused")
 prompt, *_ = Node.execute(main, "a red cube", mode="enhance", refiner_clip=refiner, writer="main", **common).args
-assert prompt == reply and not refiner.calls and "[GUIDANCE" in main.calls[0][0]
+assert prompt == reply and not refiner.calls and main.calls[0][0] == "a red cube"
 main, refiner = Clip("unused"), Clip(reply)
 prompt, *_ = Node.execute(main, "a red cube", mode="enhance", refiner_clip=refiner, writer="refiner", **common).args
 assert prompt == reply and len(main.calls) == 2
@@ -320,5 +323,29 @@ tokens, rows = node_module.rewrite_tokens(TemplateClip(), "[GUIDANCE]\nrules\n[/
 seen = TemplateClip().decode([t[0] for row in rows for t in row if isinstance(t, tuple) and isinstance(t[0], int)])
 assert seen.startswith("<|im_start|>system\nComprehend and analyze the provided prompt.") and "picture 1" not in seen
 assert sum(isinstance(t[0], dict) for row in rows for t in row if isinstance(t, tuple)) == 2
+
+# Prompt length: 0 = auto (no target, user's Max tokens, no word trim); 1-20 = soft budget; trims end on a full sentence
+trim = node_module.trim_to_words
+assert trim("One full sentence. A second one cut mid", None) == "One full sentence."
+assert trim("Glowing letters, set against a smoky backdrop, warm amber lights and", None) == "Glowing letters, set against a smoky backdrop."
+assert trim("Short and complete.", 3) == "Short and complete."
+assert node_module.length_scale(0) == 0.0 and node_module.length_scale(0.5) == 1.0 and node_module.length_scale(20) == 20.0
+assert node_module.length_budget("one two three four five six seven eight", 20.0) == (160, 320)
+
+
+class OptionClip(Clip):
+    def generate(self, tokens, **options):
+        self.options = options
+        return tokens
+
+
+long_reply = " ".join(["word"] * 300) + "."
+for dial, cap, most in ((0.0, 4096, 300), (2.0, math.ceil(40 * 1.6) + 8, 40)):   # 6 words x2 -> 20-word floor, limit 40
+    clip = OptionClip(long_reply)
+    prompt = Node.execute(clip, "a fox on a log at dawn", mode="enhance", enhance_length=dial, max_length=4096,
+                          force_rewrite=True, **common).args[0]
+    assert clip.options["max_length"] == cap, (dial, clip.options["max_length"])
+    assert ("Write about" in clip.calls[0][1]["system_prompt"]) == (dial != 0.0) and clip.calls[0][0] == "a fox on a log at dawn"
+    assert len(prompt.split()) == most if dial == 0.0 else len(prompt.split()) <= most, (dial, len(prompt.split()))
 
 print("PASS: normal/enhance/json; Generate Text keywords; image list; truncated -> Normal; refiner writes, main encodes; writer choice; rewrite reused when nothing changed; vision tower once per picture in a run and across runs; cut-off reasoning rejected")

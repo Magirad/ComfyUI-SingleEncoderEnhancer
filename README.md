@@ -7,6 +7,10 @@ tower once, for both the rewrite and the encode.
 The node was built for Qwen-Image-2.1 (Qwen3-VL encoder). It works with any CLIP that ComfyUI's **Generate Text** node
 can run. With other CLIPs, use **Normal** mode or connect a **refiner CLIP** to do the writing.
 
+**Images only.** The node is for image generation and image editing: its inputs are text and still images (up to 16).
+Unlike Generate Text it has no video or audio inputs, and its output is image conditioning, not free text for other
+uses. For video or audio prompts, use Generate Text.
+
 ## Requirements
 - ComfyUI **0.45** or newer. The node uses the V3 node API and `CLIP.generate`; it was tested on 0.45.3.
 - No extra Python packages.
@@ -20,9 +24,15 @@ Restart ComfyUI, then refresh the browser.
 
 ## Modes
 - **normal**: encodes the instruction as written, with no text generation. Works with any CLIP.
-- **enhance**: the CLIP rewrites the instruction as prose, and the prose is encoded. *Prompt length x* sets the
-  target length as a multiple of your word count; text-to-image doubles it. If the model answers with JSON anyway, the
-  fields are turned into prose, so JSON is never encoded in this mode.
+- **enhance**: the CLIP rewrites the instruction as prose, and the prose is encoded. The request is exactly what
+  ComfyUI's Generate Text sends: the guidance is the system prompt and your instruction is the user turn, so the
+  rewrite matches Generate Text word for word, but the pictures pass the vision tower only once. If the model answers with JSON
+  anyway, the fields are turned into prose, so JSON is never encoded in this mode. *Prompt length x* sets the length:
+  - *0* (default) = Auto. There is no length target, as in Generate Text: the model writes as much as the guidance
+    asks for, and only *Max tokens* limits it.
+  - *1–20* = a word budget, as a multiple of your instruction's word count (at least 20 words). It is a guide, not an
+    exact count: the model may write less, and only text beyond twice the budget is trimmed.
+  - Any trim ends on a complete sentence.
 - **json**: the CLIP writes a structured JSON prompt, and the JSON text is encoded.
   - Edit fields: `edit_instruction`, `reference_roles`, `target_description`, `preserve`.
   - Text-to-image fields: `description`, `subjects`, `background`, `composition`, `lighting`, `style`, `rendered_text`.
@@ -67,7 +77,9 @@ Restart ComfyUI, then refresh the browser.
   - Off reproduces the stock encode exactly.
   - Ignored on devices without fast bf16.
 - **Force rewrite**: redoes the rewrite, the encode and the image features on every run. Use it for timing tests.
-- **Keep model loaded**: off (default) unloads the CLIP after the node to free VRAM for the diffusion model.
+- **Keep model loaded**: on (default) works like Generate Text: the CLIP stays loaded for the next run, and ComfyUI
+  moves it out when the sampler needs the VRAM. That saves the reload, about 1.5–2 s per run. Off unloads it right
+  after the node; use off on small GPUs, or if sampling runs out of memory.
 
 ## Outputs
 - `prepared_prompt`: the text that was encoded.

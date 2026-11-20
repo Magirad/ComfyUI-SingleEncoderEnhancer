@@ -73,36 +73,19 @@ replacement only when the original request actually asks for it. Preserve reques
 inventing incompatible identities. Exclusions are constraints to respect, not features to add. Lose no
 requested subject or action and introduce no unrequested one."""
 
-ENHANCE_OUTPUT_CONTRACT = """Return only the final natural-language rewritten prompt. Match the level of
-visual detail asked for by the guidance; do not merely correct the input's grammar.
-For a new scene/composition, write descriptive prose that develops subject placement, relationships,
-the requested setting, medium, composition and lighting into one coherent picture. Ground details in
-the references and request; fill unspecified scene details only when the content guidance permits it.
-For a local edit such as changing clothing, describe the targeted change precisely and preserve the
-untargeted scene with a brief clause; do not invent a new background, crop or camera setup.
-Keep all requested subjects, actions and constraints faithful. Do not return JSON, headings, Markdown
-or reasoning."""
-
 LEGACY_LENGTHS = {"same": 1.0, "longer": 2.0, "longest": 4.0}
 
 
 def length_scale(value):
-    # The dial is a multiple of the instruction's word count; older callers pass same/longer/longest.
+    # 0 = auto (no length target, like Generate Text); 1-20 = a word budget as a multiple of the instruction's word
+    # count. Older callers pass same/longer/longest.
     scale = float(LEGACY_LENGTHS.get(value, value) if isinstance(value, str) else value)
-    if not 1.0 <= scale <= 10.0:
-        raise ValueError("Enhance length must be 1-10 (a multiple of the instruction's word count).")
+    if 0.0 < scale < 1.0:   # the slider's 0.5 step between Auto and 1x
+        scale = 1.0
+    if scale != 0.0 and not 1.0 <= scale <= 20.0:
+        raise ValueError("Prompt length must be 0 (auto) or 1-20 (a multiple of the instruction's word count).")
     return scale
 
-
-def length_guidance(scale):
-    if scale <= 1.25:
-        return "Keep approximately the original request's length. Improve clarity and visual precision without copying it verbatim or padding it."
-    text = (f"Aim for roughly {scale:g} times the original request's length. Develop relevant visual details into "
-            "fuller prose while keeping every requested constraint.")
-    if scale >= 3:
-        text += (" Use comprehensive descriptive prose, in multiple paragraphs when useful. Add only relevant details "
-                 "consistent with the request and references, without repetition or invented identities/actions.")
-    return text
 
 JSON_EDIT_CONTRACT = """Return exactly one JSON object and nothing else: no Markdown fences, no prose
 before or after it. Use this shape (values are examples):
@@ -288,26 +271,19 @@ def normalize_tags(text):
     return re.sub(r"<image_?(\d+)>", lambda match: IMAGE_TOKEN.format(int(match[1])), text)
 
 
-# Text-to-image prompts must describe a whole scene, edits only the change: the same dial means twice the words without images.
-T2I_LENGTH_FACTOR = 2.0
-
-
-def effective_scale(scale, has_images):
-    return scale if has_images else scale * T2I_LENGTH_FACTOR
-
-
 TOKENS_PER_WORD = 1.6   # covers punctuation and image tags in typical LLM tokenizers
+BUDGET_SLACK = 2.0      # the budget is a guide: the model may write up to twice it before anything is trimmed
 
 
 def length_budget(instruction, scale, max_tokens=None):
-    # Word target from the original request; the hard limit leaves 25% slack over it. A smaller token cap
-    # (max_length) wins: the budget shrinks so the model is told the length it will really get.
+    # Word budget from the original request (at least 20 words). The model is asked for about `target` words; only
+    # text beyond `limit` (twice the budget) is trimmed. A smaller Max tokens wins and shrinks both.
     target = max(20, round(len(instruction.split()) * scale))
-    limit = math.ceil(target * 1.25)
+    limit = math.ceil(target * BUDGET_SLACK)
     if max_tokens:
         fit = max(1, math.floor((max_tokens - 8) / TOKENS_PER_WORD))
         if limit > fit:
-            limit, target = fit, max(1, math.floor(fit / 1.25))
+            limit, target = fit, max(1, math.floor(fit / BUDGET_SLACK))
     return target, limit
 
 
@@ -315,56 +291,58 @@ def length_budget(instruction, scale, max_tokens=None):
 SENTENCE_END = "[.!?…][\"'”’)\\]]*"
 
 
-def trim_to_words(text, limit):
-    # Keep at most `limit` words and end on a complete sentence, also when generation stopped at the token cap.
+def trim_to_words(text, limit=None):
+    # At most `limit` words (None = no word limit), ending on a complete sentence: an unfinished last sentence
+    # (word limit or Max tokens reached mid-sentence) is dropped. A single unfinished sentence is cut back to its
+    # last clause boundary so it never ends mid-phrase.
     words = text.split()
-    cut = " ".join(words[:limit]) if len(words) > limit else text.strip()
+    cut = " ".join(words[:limit]) if limit and len(words) > limit else text.strip()
     if re.search(SENTENCE_END + "$", cut):
         return cut
     ends = [match.end() for match in re.finditer(SENTENCE_END + r"(?=\s)", cut)]
-    if ends and ends[-1] > len(cut) // 2:
+    if ends:
         return cut[:ends[-1]]
+    clauses = [match.start() for match in re.finditer(r"[,;:]\s", cut)]
+    if clauses and clauses[-1] > len(cut) // 2:
+        cut = cut[:clauses[-1]]
     return cut.rstrip(",;:-— ") + "."
 
 
+def generate_like_textgen(clip, system_prompt, instruction, images, options, thinking):
+    # The request Generate Text builds: the guidance replaces the template's system turn, the instruction is the user
+    # turn, the pictures go in as Generate Text passes them. Nothing else is added.
+    tokens = clip.tokenize(instruction, images=images, skip_template=False, min_length=1, thinking=thinking,
+                           system_prompt=system_prompt)
+    with matched_attention_dtypes():
+        text = clip.decode(clip.generate(tokens, **options))
+    if thinking and "</think>" not in text and not text.lstrip().startswith("<think>"):
+        # like Generate Text: a template that opens the reasoning block itself and no close = Max tokens cut it off
+        rows = next((value for value in tokens.values() if isinstance(value, list)), []) if isinstance(tokens, dict) else tokens
+        ids = [token[0] for token in (rows[-1] if rows else []) if isinstance(token, tuple) and isinstance(token[0], int)]
+        if ids and clip.decode(ids[-4:]).rstrip().endswith("<think>"):
+            text = "<think>" + text
+    return text
+
+
 def generate_enhancement(clip, system_prompt, default_system, user_prompt, images, options,
-                         *, original_instruction, negative_prompt, enhance_length=1.0, chat=None):
-    scale = effective_scale(length_scale(enhance_length), bool(images))
+                         *, original_instruction, negative_prompt, enhance_length=0.0, chat=None):
+    # Direct replacement for Generate Text -> encode: same request, same answer. The node only adds what its own
+    # inputs ask for (a length budget, the negative prompt) as lines of the system prompt, and cleans the answer
+    # (reasoning removed, a JSON answer turned into prose, a budget trim ending on a full sentence).
+    scale = length_scale(enhance_length)
     thinking = bool(chat and chat.get("thinking"))
-    target, limit = length_budget(original_instruction, scale, None if thinking else options.get("max_length"))
-    output_contract = (ENHANCE_OUTPUT_CONTRACT + "\n\n[ENHANCE_LENGTH]\n" + length_guidance(scale)
-                       + f" Write about {target} words and never more than {limit} words; "
-                       "put every requested change and preserved attribute inside that budget.")
-    # generation stops at the word limit's token equivalent at the latest
-    cap = math.ceil(limit * TOKENS_PER_WORD) + 8
-    if not thinking:   # reasoning comes first and needs room; the answer is still trimmed to the word limit
-        options = {**options, "max_length": min(options.get("max_length", cap), cap)}
-    tags = ", ".join(IMAGE_TOKEN.format(index) for index in range(1, len(images) + 1))
-    output_contract += (f"\n\n[IMAGE_REFERENCES]\nThere are {len(images)} reference images. "
-                        + (f"Available tags, in input order: {tags}. " if tags else "Do not use image tags. ")
-                        + "With several images, identify each source by its tag; with one image a tag is optional. "
-                        "Never reference an image outside this list. Preserve all subjects and relationships requested by the user.")
     guidance = system_prompt or default_system
-    raw = generate_text(clip, guidance, user_prompt, images, options,
-                        original_instruction=original_instruction, negative_prompt=negative_prompt,
-                        output_contract=output_contract, chat=chat)
-    for attempt in range(2):
-        try:
-            prompt = rewrite_prompt(raw, len(images))
-            for source in (original_instruction, user_prompt):
-                if " ".join(prompt.split()) == " ".join(normalize_tags(source).split()):
-                    raise ValueError("the rewrite only echoed the input or its preservation context")
-            # trim after the echo check: an added final period must not disguise an echoed input
-            return raw, trim_to_words(prompt, limit)
-        except ValueError as error:
-            if attempt:
-                raise ValueError(f"Enhance could not produce rewritten prose after one retry: {error}. "
-                                 "Check the system prompt, image inputs and max_length. No original-prompt fallback was encoded.") from error
-            logging.warning("Single Encoder Enhancer: %s. Retrying once on the same CLIP with prose guidance.", error)
-            repair_request = user_prompt + "\n\nRewrite the original request as prose; do not copy it verbatim."
-            raw = generate_text(clip, guidance, repair_request, images, options,
-                                original_instruction=original_instruction, negative_prompt=negative_prompt,
-                                output_contract=output_contract, chat=chat)
+    limit = None
+    if scale:
+        target, limit = length_budget(original_instruction, scale, None if thinking else options.get("max_length"))
+        guidance += f"\n\nWrite about {target} words; this is a guide, not an exact count."
+        cap = math.ceil(limit * TOKENS_PER_WORD) + 8   # generation stops at the trim limit's token equivalent
+        if not thinking:   # reasoning comes first and needs room; the answer is still trimmed to the limit
+            options = {**options, "max_length": min(options.get("max_length", cap), cap)}
+    if negative_prompt.strip():
+        guidance += "\n\nAvoid: " + negative_prompt.strip()
+    raw = generate_like_textgen(clip, guidance, user_prompt, images, options, thinking)
+    return raw, trim_to_words(rewrite_prompt(raw, len(images)), limit)
 
 
 @contextmanager
@@ -558,7 +536,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
                 io.Combo.Input("mode", display_name="Mode", options=["enhance", "normal", "json"], default="enhance",
                                tooltip="Normal: encode the instruction as written (no text generation). Enhance: the CLIP rewrites the instruction as prose, which is encoded. JSON: the CLIP writes a structured JSON prompt (text-to-image: description, subjects, background, composition, lighting, style, rendered_text; edits: edit_instruction, reference_roles, target_description, preserve) and the JSON text itself is encoded."),
                 io.Combo.Input("writer", display_name="Writer", options=["auto", "main", "refiner"], default="auto",
-                               tooltip="Active while a refiner CLIP is connected (greyed out otherwise): which model writes the Enhance/JSON rewrite. Auto: the main CLIP when it can write (no second model load), the refiner only when it cannot (truncated or non-LLM encoders). Main: same as auto. Refiner: the refiner writes, e.g. a different or larger writer. If the chosen model cannot write, the other one does; the main CLIP always encodes."),
+                               tooltip="Active while a refiner CLIP is connected (hidden otherwise): which model writes the Enhance/JSON rewrite. Auto: the main CLIP when it can write (no second model load), the refiner only when it cannot (truncated or non-LLM encoders). Main: same as auto. Refiner: the refiner writes, e.g. a different or larger writer. If the chosen model cannot write, the other one does; the main CLIP always encodes."),
                 io.Int.Input("resolution", display_name="Resolution", default=1024, min=0, max=4096, step=32,
                              tooltip="Output size: images are resized to about resolution x resolution pixels (aspect kept) and the latent follows image 1; without images the latent is resolution x resolution. 0 = images at their own size. The rewrite sees the same resized images the encode uses."),
                 io.Autogrow.Input("images", template=io.Autogrow.TemplateNames(
@@ -569,13 +547,13 @@ class SingleEncoderEnhancer(io.ComfyNode):
                               tooltip="Optional second text model that writes the Enhance/JSON rewrite; the main CLIP then encodes it. Use it when the main CLIP cannot write text (truncated or non-LLM encoders) or when you want a different writer. With Writer = auto it writes only when the main CLIP cannot; set Writer = refiner to make it write. Not connected: the main CLIP writes and encodes. If no connected CLIP can write, the instruction is encoded as written. Costs a second model load; it is unloaded before the encode unless Keep model loaded is on."),
                 io.String.Input("negative_prompt", display_name="Negative prompt", multiline=True, default="", advanced=True,
                                 tooltip="Things to avoid. In Enhance/JSON it is passed to the rewrite as exclusions, and it is encoded as the negative conditioning (unless Encode negative is off). Has no effect on the image at CFG 1."),
-                io.Float.Input("enhance_length", display_name="Prompt length x", default=1.0, min=1.0, max=10.0, step=0.5,
+                io.Float.Input("enhance_length", display_name="Prompt length x", default=0.0, min=0.0, max=20.0, step=0.5,
                                display_mode=io.NumberDisplay.slider,
-                               tooltip="Enhance only. Target length of the rewrite as a multiple of your instruction's word count (at least 20 words). With images: 1 = about the same length, up to 10x. Without images (text-to-image) the multiple is doubled: 1 = 2x, up to 20x. Hard limit: +25% over the target, cut back to the last full sentence. A low Max tokens shrinks it."),
+                               tooltip="Enhance only. 0 = Auto: no length target, like Generate Text; the model writes as much as the guidance asks for and only Max tokens limits it. 1-20 = a word budget: about this multiple of your instruction's word count (at least 20 words). It is a guide, not an exact count: the model may write less, and only text beyond twice the budget is trimmed. Any trim ends on a complete sentence. A low Max tokens shrinks the budget."),
                 io.Int.Input("max_length", display_name="Max tokens", default=4096, min=1, max=32768,
                              tooltip="Maximum tokens the CLIP may generate in Enhance and JSON. In Enhance it also shrinks the word budget when it is lower than the length dial needs (about 1.6 tokens per word). With thinking on it must cover reasoning + answer. JSON output cut off by this limit is retried once, then the node stops with an error (nothing is encoded). Not used in Normal."),
                 io.Boolean.Input("do_sample", display_name="Sampling", default=False,
-                                 tooltip="Off: the rewrite is deterministic (always the most likely token), so the same inputs give the same prompt. On: random sampling with the seed, temperature and the top k / top p / min p / penalty settings below, which are active only while Sampling is on (greyed out otherwise). Only affects the text rewrite, not the image sampler."),
+                                 tooltip="Off: the rewrite is deterministic (always the most likely token), so the same inputs give the same prompt. On: random sampling with the seed, temperature and the top k / top p / min p / penalty settings below, which are active only while Sampling is on (hidden otherwise). Only affects the text rewrite, not the image sampler."),
                 io.Int.Input("seed", display_name="Seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
                              tooltip="Seed for the rewrite when Sampling is on. Separate from the image sampler's seed."),
                 io.Float.Input("temperature", display_name="Temperature", default=0.2, min=0.01, max=2.0, step=0.05,
@@ -586,22 +564,22 @@ class SingleEncoderEnhancer(io.ComfyNode):
                                tooltip="Sampling on: pick only from the most likely tokens that together reach this probability. Same as Generate Text."),
                 io.Float.Input("min_p", display_name="Min p", default=0.05, min=0.0, max=1.0, step=0.01,
                                tooltip="Sampling on: drop tokens less likely than this fraction of the top token's probability. Same as Generate Text."),
-                io.Float.Input("repetition_penalty", display_name="Repetition penalty", default=1.05, min=0.0, max=5.0, step=0.01,
+                io.Float.Input("repetition_penalty", display_name="Repetition penalty", default=1.0, min=0.0, max=5.0, step=0.01,
                                tooltip="Applies with Sampling on or off: values above 1 make already-used tokens less likely, reducing repeated words. 1 = off. Same as Generate Text."),
                 io.Float.Input("presence_penalty", display_name="Presence penalty", default=0.0, min=0.0, max=5.0, step=0.01,
                                tooltip="Applies with Sampling on or off: subtracts this from every already-used token, pushing toward new words. 0 = off. Same as Generate Text."),
                 io.Boolean.Input("thinking", display_name="Thinking", default=False,
                                  tooltip="Ask the model to reason before it writes, like Generate Text's thinking option. Works only on models whose chat template supports it; others ignore it. Much slower. The reasoning appears in raw_output and is not encoded; set Max tokens high enough for reasoning + answer."),
                 io.String.Input("system_prompt", display_name="System prompt", optional=True, force_input=True,
-                                tooltip="Optional: replaces the built-in rewrite guidance (Enhance/JSON) with your own. It is given to the model as guidance in the request; the model's own system prompt is kept. The node still adds its own output-format rules for the selected mode, so guidance asking for another format cannot break the encode. Empty = built-in guidance."),
+                                tooltip="Optional: replaces the built-in rewrite guidance. Enhance: sent as the system prompt, exactly as Generate Text sends its system prompt. JSON: kept as the content guide; the node still adds its JSON field rules, so a prompt asking for another format cannot break the encode. Empty = built-in guidance."),
                 io.Boolean.Input("force_rewrite", display_name="Force rewrite", default=False,
                                  tooltip="Off: an unchanged request (same writer, texts, pictures and settings) reuses its stored rewrite, so nothing is generated again. On: do all the work again on every run, also when nothing changed: a fresh rewrite, a fresh encode and fresh image features (nothing is reused from earlier runs). Use it for timing tests. With Sampling off the fresh rewrite is the same text."),
                 io.Combo.Input("encode_negative", display_name="Encode negative", options=["on", "auto", "off"], default="auto",
                                tooltip="On: encode the negative prompt normally. Off: skip that encode pass and output a zeroed negative. Auto: Off while the negative prompt is empty, On when it has text. A zeroed negative is only the same image at CFG 1, where the sampler never reads the negative; above CFG 1 an encoded empty negative and a zeroed one give different images."),
                 io.Boolean.Input("fast_encode", display_name="Fast encode (bf16)", default=False,
                                  tooltip="Single-model text encoders that ComfyUI runs with fp32 activations: encode in bf16 instead. Faster; the conditioning differs slightly from the default. Off = exactly ComfyUI's default encode."),
-                io.Boolean.Input("keep_model_loaded", display_name="Keep model loaded", default=False,
-                                 tooltip="On: leave the CLIP loaded for the next run (ComfyUI may still offload it when VRAM is needed). Off: unload it from the GPU after this node, also on errors, to free VRAM for the diffusion model."),
+                io.Boolean.Input("keep_model_loaded", display_name="Keep model loaded", default=True,
+                                 tooltip="On (default): like Generate Text, the CLIP stays loaded for the next run and ComfyUI moves it out when the sampler needs the VRAM; saves the reload (about 1.5-2 s per run). Off: unload it from the GPU right after this node, also on errors; use it on small GPUs or if sampling runs out of memory."),
             ],
             outputs=[
                 io.String.Output(display_name="prepared_prompt"),
@@ -625,8 +603,8 @@ class SingleEncoderEnhancer(io.ComfyNode):
     @classmethod
     def execute(cls, clip, instruction, images=None, vae=None, refiner_clip=None, writer="auto", max_length=4096, do_sample=False, seed=0,
                 negative_prompt="", system_prompt="", mode="enhance", temperature=0.2, resolution=1024,
-                enhance_length=1.0, keep_model_loaded=False, encode_negative="auto", fast_encode=False, thinking=False,
-                top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.05, presence_penalty=0.0, force_rewrite=False,
+                enhance_length=0.0, keep_model_loaded=True, encode_negative="auto", fast_encode=False, thinking=False,
+                top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.0, presence_penalty=0.0, force_rewrite=False,
                 **_retired):
         if mode not in ("enhance", "json", "normal"):
             raise ValueError("Choose mode=normal, enhance or json.")
@@ -654,6 +632,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
         # resized once: the rewrite, the reference latents and the latent size all use these pictures
         vision, vae_pixels, latent_size = reference_images(references, resolution)
 
+        started = time.perf_counter()
         with ExitStack() as stack:
             stack.enter_context(hash_memo())   # each picture is hashed once per run for all the caches
             stack.enter_context(encoder_lifetime(clip, keep_model_loaded))
@@ -687,9 +666,13 @@ class SingleEncoderEnhancer(io.ComfyNode):
                                                  options, enhance_length, {"thinking": thinking})
                 if found is None and keep:
                     REWRITE_STORE.store(key, owner, (raw, prompt))
+            written = time.perf_counter()
             if reuse:
                 stack.enter_context(text_encode_cache(clip, fast_encode))
             with bf16_encode(clip, fast_encode):
                 positive, negative, latent = encode_plain(clip, prompt, vision, latent_size, vae, resolution,
                                                           negative_prompt, encode_negative, vae_pixels)
+            # one line per run so users (and timing comparisons) can see where the time goes
+            logging.info("Single Encoder Enhancer timing: rewrite %.2f s, encode %.2f s (mode %s).",
+                         written - started, time.perf_counter() - written, mode)
             return io.NodeOutput(prompt, positive, negative, raw, latent)

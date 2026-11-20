@@ -21,22 +21,31 @@ function hook(node, widget) {
     widget.enhancerHook = true;
 }
 
-// Widgets that do not apply are greyed out (disabled), never hidden: hiding removes their rows, so the node
-// would change size every time Mode, Sampling or the refiner connection changes.
+// Widgets that do not apply are hidden. Like Generate Text, the node then shrinks or grows from the bottom by exactly
+// the rows that were hidden or shown, so the instruction box keeps its size (a multiline box takes any spare height,
+// so keeping the node size would make the box grow instead).
 function updateWidgets(node) {
+    const before = node.computeSize?.()[1];
     const get = name => node.widgets?.find(widget => widget.name === name);
     const mode = get("mode"), sample = get("do_sample"), seed = get("seed"), negative = get("encode_negative");
     hook(node, mode);
     hook(node, sample);
     const normal = mode?.value === "normal";
     const refiner = node.inputs?.find(input => input.name === "refiner_clip");
+    const size = [...node.size];
     for (const widget of node.widgets ?? []) {
-        if (widget.hidden) widget.hidden = false;   // earlier versions of this script hid widgets
-        if (SAMPLING.includes(widget.name)) widget.disabled = normal || !sample?.value;
-        else if (REWRITE.includes(widget.name)) widget.disabled = normal;
-        else if (widget.name === "enhance_length") widget.disabled = mode?.value !== "enhance";
-        else if (widget.name === "writer") widget.disabled = normal || refiner?.link == null;   // needs a refiner CLIP
+        let unused = null;
+        if (SAMPLING.includes(widget.name)) unused = normal || !sample?.value;
+        else if (REWRITE.includes(widget.name)) unused = normal;
+        else if (widget.name === "enhance_length") unused = mode?.value !== "enhance";
+        else if (widget.name === "writer") unused = normal || refiner?.link == null;   // needs a refiner CLIP
+        if (unused === null) continue;
+        widget.hidden = unused;
+        widget.disabled = unused;   // also greyed out where a frontend ignores hidden
     }
+    // change the height by the rows that appeared or disappeared; the user's extra height (and width) stays
+    const after = node.computeSize?.()[1];
+    if (before != null && after != null && after !== before) node.setSize?.([size[0], Math.max(after, size[1] + after - before)]);
     // While the seed is not used (Sampling off or Normal) a constant is sent, so a seed set to randomize/increment
     // does not make ComfyUI run this node and everything after it again on every queue.
     if (seed && !seed.enhancerSeed) {

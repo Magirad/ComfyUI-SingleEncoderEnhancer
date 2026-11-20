@@ -1,0 +1,16 @@
+[project]
+name = "single-encoder-enhancer"
+description = "One CLIP rewrites the instruction (prose or JSON) with its own language model and encodes it: one model load, one vision-tower pass per picture. Built for Qwen-Image-2.1; works with any CLIP that Generate Text can run."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Magirad/ComfyUI-SingleEncoderEnhancer"
+
+[tool.comfy]
+PublisherId = "magirad"
+DisplayName = "Single Encoder Enhancer"
+Icon = ""
+includes = []
+requires-comfyui = ">=0.45.0"

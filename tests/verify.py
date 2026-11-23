@@ -294,15 +294,75 @@ try:
 except ValueError as error:
     assert "after one retry" in str(error) and not clip.encoded
 
-# Enhance given a JSON answer builds prose from its fields instead of failing; JSON is never encoded in Enhance
-clip = Replies(['{"edit_instruction": "Put the red coat from <image2> on the woman in <image1>", '
-                '"target_description": "a knee-length red wool coat", "preserve": ["her face", "the beach"]}'])
-prompt, *_ = Node.execute(clip, "coat of <image2> on <image1>", mode="enhance", images={"image_1": image, "image_2": wide}, **common).args
-assert prompt.startswith("Put the red coat from <image2> on the woman in <image1>.") and "Keep her face, the beach unchanged." in prompt
-assert not prompt.lstrip().startswith("{") and clip.generated == 1
-clip = Replies(['{"description": "A harbor at dawn", "lighting": "soft gold light"}'])
+# Enhance with the built-in guidance is always prose: a JSON answer gets one retry for prose; JSON twice stops the node
+clip = Replies(['{"short_description": "a man"}', "A man in a yellow raincoat stands on a wet street."])
+prompt, *_ = Node.execute(clip, "a man in a raincoat", mode="enhance", **common).args
+assert prompt == "A man in a yellow raincoat stands on a wet street." and clip.generated == 2
+assert any("natural-language prose, not JSON" in c[0] for c in clip.calls) and clip.encoded[0] == prompt
+clip = Replies(['{"short_description": "a man"}', '```json\n{"short_description": "a man"}\n```'])
+try:
+    Node.execute(clip, "a man", mode="enhance", **common)
+    raise SystemExit("FAIL: Enhance with built-in guidance encoded a JSON answer")
+except ValueError as error:
+    assert "use mode JSON" in str(error) and not clip.encoded
+# Enhance with a connected system prompt: that prompt decides the format; its JSON is checked and passed on unchanged
+vgl_answer = '{"short_description": "a man in a yellow raincoat", "edit_instruction": "Put the coat from <image_2> on him."}'
+clip = Replies([vgl_answer])
+prompt, *_ = Node.execute(clip, "coat of <image_2> on <image_1>", mode="enhance", system_prompt="Answer with a VGL JSON caption.",
+                          images={"image_1": image, "image_2": wide}, enhance_length=2.0, **common).args
+assert json.loads(prompt) == json.loads(vgl_answer) and "<image_2>" in prompt and clip.generated == 1
+clip = Replies(['{"short_description": "a man",\n "edit_instruction": "Put the coat on him."'])   # missing final brace
+prompt, *_ = Node.execute(clip, "a man", mode="enhance", system_prompt="Answer with a VGL JSON caption.", **common).args
+assert json.loads(prompt) == {"short_description": "a man", "edit_instruction": "Put the coat on him."} and clip.generated == 1
+cut = '{"short_description": "a man", "objects": [{"description": "a young man wearing a yellow rainc'
+clip = Replies([cut, cut])
+try:
+    Node.execute(clip, "a man", mode="enhance", system_prompt="Answer with a VGL JSON caption.", **common)
+    raise SystemExit("FAIL: Enhance encoded a cut-off JSON answer")
+except ValueError as error:
+    assert "cut off" in str(error) and not clip.encoded and clip.generated == 2
+clip = Replies(["A plain prose answer from a prose system prompt."])
+prompt, *_ = Node.execute(clip, "a man", mode="enhance", system_prompt="Describe the scene in rich prose.", **common).args
+assert prompt == "A plain prose answer from a prose system prompt." and clip.generated == 1
+
+
+class SeesOptions(Clip):
+    def generate(self, tokens, **options):
+        self.options, self.generated = options, getattr(self, "generated", 0) + 1
+        return tokens
+
+
+OptionClip = SeesOptions
+clip = OptionClip("A man in a yellow raincoat stands on a wet street at night.")
+Node.execute(clip, "coat of <image_2> on <image_1>", mode="enhance", system_prompt="Describe the scene in rich prose.",
+             images={"image_1": image, "image_2": wide}, enhance_length=2.0, max_length=4096, **common)
+# with a system prompt connected, the prose budget does not cap generation (its format may need far more tokens)
+assert clip.options["max_length"] == 4096
+clip = OptionClip("A fox on a log at dawn, mist over the water.")
+Node.execute(clip, "a fox on a log at dawn", mode="enhance", enhance_length=2.0, max_length=4096, force_rewrite=True, **common)
+assert clip.options["max_length"] == math.ceil(40 * 1.6) + 8   # no system prompt: the budget cap still applies
+# a tag for a picture that is not connected is kept with a warning, not an error (Generate Text passes it too)
+clip = Replies(["Put the coat from <image3> on the man in <image1>."])
+prompt, *_ = Node.execute(clip, "coat on <image1>", mode="enhance", images={"image_1": image}, **common).args
+assert prompt == "Put the coat from <image3> on the man in <image1>."
+# a fenced answer is unwrapped, also when the closing fence is missing
+clip = Replies(["```\nA harbor at dawn.\n"])
 prompt, *_ = Node.execute(clip, "a harbor", mode="enhance", **common).args
-assert prompt == "A harbor at dawn. Lighting: soft gold light."
+assert prompt == "A harbor at dawn."
+# a JSON-mode answer cut off inside a string is never repaired into a half caption: retry, then a clear error
+cut = '{"short_description": "a man", "objects": [{"description": "a young man wearing a yellow rainc'
+clip = Replies([cut, cut])
+try:
+    Node.execute(clip, "a man", mode="json", system_prompt="Answer with a VGL JSON caption.", **common)
+    raise SystemExit("FAIL: a cut-off JSON answer was encoded")
+except ValueError as error:
+    assert "cut off" in str(error) and "Max tokens" in str(error) and not clip.encoded
+clip = Replies([cut, cut])
+try:
+    Node.execute(clip, "a man", mode="json", **common)   # built-in schema: no repair of a cut-off object either
+    raise SystemExit("FAIL: a cut-off built-in JSON answer was encoded")
+except ValueError as error:
+    assert not clip.encoded
 
 
 # the VAE gets all four channels of an RGBA picture (as natively); the vision tower gets alpha over white

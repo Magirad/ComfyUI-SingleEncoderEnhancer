@@ -1,7 +1,7 @@
 [project]
 name = "single-encoder-enhancer"
 description = "One CLIP rewrites the instruction (prose or JSON) with its own language model and encodes it: one model load, one vision-tower pass per picture. Built for Qwen-Image-2.1; works with any CLIP that Generate Text can run."
-version = "1.0.2"
+version = "1.0.3"
 license = { file = "LICENSE" }
 dependencies = []
 

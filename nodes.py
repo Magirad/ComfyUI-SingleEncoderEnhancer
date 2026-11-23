@@ -158,6 +158,7 @@ def repair_json(text):
             stack.append("}" if char == "{" else "]")
         elif char in "}]" and stack:
             stack.pop()
+    # an answer that stops inside a string was cut off: it is not repaired (a half value must never be encoded)
     return text if in_string else text.rstrip(",") + "".join(reversed(stack))
 
 
@@ -179,6 +180,8 @@ def outer_json_object(raw):
             logging.info("Single Encoder Enhancer JSON: repaired a missing or extra comma (%s at character %d); "
                          "no regeneration needed.", problem.msg, problem.pos)
         except json.JSONDecodeError:
+            if problem.msg.startswith("Unterminated string") or problem.pos >= len(text[start:].rstrip()) - 1:
+                raise ValueError("the JSON answer was cut off before it ended (raise Max tokens)") from None
             raise ValueError(f"invalid JSON ({problem.msg} at character {problem.pos})") from None
     if not isinstance(value, dict) or not value:
         raise ValueError("no JSON object")
@@ -255,60 +258,23 @@ def generate_text(clip, guidance, user_prompt, images, options, *, original_inst
     return text
 
 
-def json_to_prose(plan):
-    # Prose from a structured answer: the rewritten_prompt field, the JSON-mode edit/scene fields, or its text values.
-    def words(value):
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, list):
-            return ", ".join(item for item in (words(v) for v in value) if item)
-        if isinstance(value, dict):
-            return "; ".join(f"{key}: {item}" for key, item in ((k, words(v)) for k, v in value.items()) if item)
-        return ""
-
-    def sentence(value):
-        value = words(value)
-        return value if not value or value[-1] in ".!?" else value + "."
-
-    if words(plan.get("rewritten_prompt")):
-        return words(plan["rewritten_prompt"])
-    if words(plan.get("edit_instruction")) or words(plan.get("target_description")):
-        parts = [sentence(plan.get("edit_instruction")), sentence(plan.get("target_description"))]
-        if keep := words(plan.get("preserve")):
-            parts.append(sentence("Keep " + keep + " unchanged"))
-        return " ".join(part for part in parts if part)
-    if words(plan.get("description")):
-        parts = [sentence(plan["description"])]
-        for key in ("subjects", "background", "composition", "lighting", "style"):
-            if value := words(plan.get(key)):
-                parts.append(sentence(f"{key.capitalize()}: {value}"))
-        if lettering := words(plan.get("rendered_text")):
-            parts.append(sentence(f'Visible text reads "{lettering}"'))
-        return " ".join(parts)
-    return " ".join(sentence(value) for value in plan.values() if words(value))
-
-
 def rewrite_prompt(raw, image_count):
+    # -> (text to encode, whether it is a JSON answer). Like Generate Text, the answer is used as the model wrote it;
+    # only what cannot be encoded stops the node (no answer, or reasoning cut off before the answer).
     text = (raw.partition("</think>")[-1] if "</think>" in raw else raw).strip()
     if text.startswith("<think>") or not text:
-        raise ValueError("empty or unfinished rewrite")
-    if text.startswith("```"):
-        if not text.endswith("```"):
-            raise ValueError("unfinished fenced rewrite")
-        text = text.partition("\n")[2].rsplit("```", 1)[0].strip()
-    # A model that answers with a JSON object (its own transport format or JSON-mode fields) is turned into prose:
-    # Enhance never conditions on JSON itself.
-    if text.startswith("{"):
-        plan = json_object(text)
-        text = json_to_prose(plan) if isinstance(plan, dict) else None
-    if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[", "```", "<think>")):
-        raise ValueError("missing rewritten prose")
-    text = normalize_tags(text.strip())
+        raise ValueError("empty answer, or reasoning cut off before the answer (raise Max tokens)")
+    if text.startswith("```"):   # a fenced answer: the fence lines are not part of the prompt
+        text = text.partition("\n")[2]
+        text = (text.rsplit("```", 1)[0] if "```" in text else text).strip()
+    if text.startswith(("{", "[")):   # Enhance writes prose; JSON belongs to mode JSON (the caller asks again)
+        return text, True
+    text = normalize_tags(text)
     slots = {int(i) for i in re.findall(r"<image_?(\d+)>", text)}
     if unavailable := slots - set(range(1, image_count + 1)):
-        tags = ", ".join(IMAGE_TOKEN.format(index) for index in sorted(unavailable))
-        raise ValueError(f"references unavailable image tags {tags}; {image_count} reference image(s) supplied")
-    return text
+        logging.warning("Single Encoder Enhancer: the rewrite refers to %s but %d picture(s) are connected; encoded as written.",
+                        ", ".join(IMAGE_TOKEN.format(index) for index in sorted(unavailable)), image_count)
+    return text, False
 
 
 def normalize_tags(text):
@@ -372,7 +338,7 @@ def generate_enhancement(clip, system_prompt, default_system, user_prompt, image
                          *, original_instruction, negative_prompt, enhance_length=0.0, chat=None):
     # Direct replacement for Generate Text -> encode: same request, same answer. The node only adds what its own
     # inputs ask for (a length budget, the negative prompt) as lines of the system prompt, and cleans the answer
-    # (reasoning removed, a JSON answer turned into prose, a budget trim ending on a full sentence).
+    # (reasoning removed, a fenced answer unwrapped, a budget trim ending on a full sentence; JSON only when a connected system prompt asks for it).
     scale = length_scale(enhance_length)
     thinking = bool(chat and chat.get("thinking"))
     guidance = system_prompt or default_system
@@ -381,12 +347,41 @@ def generate_enhancement(clip, system_prompt, default_system, user_prompt, image
         target, limit = length_budget(original_instruction, scale, None if thinking else options.get("max_length"))
         guidance += f"\n\nWrite about {target} words; this is a guide, not an exact count."
         cap = math.ceil(limit * TOKENS_PER_WORD) + 8   # generation stops at the trim limit's token equivalent
-        if not thinking:   # reasoning comes first and needs room; the answer is still trimmed to the limit
+        # Not with a connected system prompt: it may ask for another format (e.g. a JSON caption) that needs far more
+        # tokens than the prose budget; only Max tokens limits it then. Reasoning also needs room.
+        if not thinking and not system_prompt:
             options = {**options, "max_length": min(options.get("max_length", cap), cap)}
     if negative_prompt.strip():
         guidance += "\n\nAvoid: " + negative_prompt.strip()
     raw = generate_like_textgen(clip, guidance, user_prompt, images, options, thinking)
-    return raw, trim_to_words(rewrite_prompt(raw, len(images)), limit)
+    prompt, is_json = rewrite_prompt(raw, len(images))
+    if is_json and system_prompt:
+        # A connected system prompt decides the format: its JSON (e.g. Bria's VGL) is accepted, checked like mode
+        # JSON (small slips repaired, a cut-off answer asked again) and passed on unchanged, with no word trim.
+        for attempt in range(2):
+            try:
+                caption = outer_json_object(raw)
+                return raw, json.dumps(caption, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except ValueError as error:
+                if attempt:
+                    raise ValueError(f"Enhance: the system prompt's JSON answer was not usable after one retry: {error}. "
+                                     "See raw_output. Nothing was encoded.") from error
+                logging.warning("Single Encoder Enhancer: %s. Retrying once.", error)
+                raw = generate_like_textgen(clip, guidance, user_prompt + f"\n\nYour previous answer was not usable ({error}). "
+                                            "Answer again with one complete answer.", images, options, thinking)
+                prompt, is_json = rewrite_prompt(raw, len(images))
+                if not is_json:   # the retry came back as prose: that is a valid answer too
+                    return raw, trim_to_words(prompt, limit)
+    if is_json:
+        # Built-in guidance asks for prose, so a JSON answer is a slip: one more try that asks for prose, then stop.
+        logging.warning("Single Encoder Enhancer: the model answered with JSON in Enhance; asking once more for prose.")
+        raw = generate_like_textgen(clip, guidance, user_prompt + "\n\nWrite the answer as natural-language prose, "
+                                    "not JSON and not a list.", images, options, thinking)
+        prompt, is_json = rewrite_prompt(raw, len(images))
+        if is_json:
+            raise ValueError("Enhance: the built-in guidance asks for prose, but the model answered with JSON twice. "
+                             "For JSON use mode JSON. Nothing was encoded.")
+    return raw, trim_to_words(prompt, limit)
 
 
 @contextmanager
@@ -594,7 +589,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.String.Input("instruction", display_name="Instruction", multiline=True),
                 io.Combo.Input("mode", display_name="Mode", options=["enhance", "normal", "json"], default="enhance",
-                               tooltip="Normal: encode the instruction as written (no text generation). Enhance: the CLIP rewrites the instruction as prose, which is encoded. JSON: the CLIP writes a structured JSON prompt (text-to-image: description, subjects, background, composition, lighting, style, rendered_text; edits: edit_instruction, reference_roles, target_description, preserve) and the JSON text itself is encoded."),
+                               tooltip="Normal: encode the instruction as written (no text generation). Enhance: the CLIP rewrites the instruction and the rewrite is encoded; with the built-in guidance it is always prose, with a connected System prompt it is in whatever format that prompt asks for (prose, or JSON such as Bria's VGL, checked and passed on unchanged). JSON: always a JSON prompt, checked (small slips repaired, otherwise one retry): the built-in fields (text-to-image: description, subjects, background, composition, lighting, style, rendered_text; edits: edit_instruction, reference_roles, target_description, preserve), or the JSON your connected System prompt asks for."),
                 io.Combo.Input("writer", display_name="Writer", options=["auto", "main", "refiner"], default="auto",
                                tooltip="Active while a refiner CLIP is connected (hidden otherwise): which model writes the Enhance/JSON rewrite. Auto: the main CLIP when it can write (no second model load), the refiner only when it cannot (truncated or non-LLM encoders). Main: same as auto. Refiner: the refiner writes, e.g. a different or larger writer. If the chosen model cannot write, the other one does; the main CLIP always encodes."),
                 io.Int.Input("resolution", display_name="Resolution", default=1024, min=0, max=4096, step=32,
@@ -631,7 +626,7 @@ class SingleEncoderEnhancer(io.ComfyNode):
                 io.Boolean.Input("thinking", display_name="Thinking", default=False,
                                  tooltip="Ask the model to reason before it writes, like Generate Text's thinking option. Works only on models whose chat template supports it; others ignore it. Much slower. The reasoning appears in raw_output and is not encoded; set Max tokens high enough for reasoning + answer."),
                 io.String.Input("system_prompt", display_name="System prompt", optional=True, force_input=True,
-                                tooltip="Optional: replaces the built-in rewrite guidance. Enhance: sent as the system prompt, exactly as Generate Text sends its system prompt. JSON: also sent as the system prompt exactly as Generate Text does (e.g. Bria's VGL prompt for Fibo 2); any JSON object it produces is encoded with its own keys, one retry if the answer is not JSON. Empty = built-in guidance and the built-in JSON fields."),
+                                tooltip="Optional: replaces the built-in rewrite guidance and is sent as the system prompt, exactly as Generate Text sends it. It decides the format: in Enhance its answer is used as it comes (prose, or JSON it asks for); in JSON mode the answer must be a JSON object. Empty = built-in guidance (Enhance: prose; JSON: the built-in fields)."),
                 io.Boolean.Input("force_rewrite", display_name="Force rewrite", default=False,
                                  tooltip="Off: an unchanged request (same writer, texts, pictures and settings) reuses its stored rewrite, so nothing is generated again. On: do all the work again on every run, also when nothing changed: a fresh rewrite, a fresh encode and fresh image features (nothing is reused from earlier runs). Use it for timing tests. With Sampling off the fresh rewrite is the same text."),
                 io.Combo.Input("encode_negative", display_name="Encode negative", options=["on", "auto", "off"], default="auto",

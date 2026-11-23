@@ -26,8 +26,10 @@ Restart ComfyUI, then refresh the browser.
 - **normal**: encodes the instruction as written, with no text generation. Works with any CLIP.
 - **enhance**: the CLIP rewrites the instruction as prose, and the prose is encoded. The request is exactly what
   ComfyUI's Generate Text sends: the guidance is the system prompt and your instruction is the user turn, so the
-  rewrite matches Generate Text word for word, but the pictures pass the vision tower only once. If the model answers with JSON
-  anyway, the fields are turned into prose, so JSON is never encoded in this mode. *Prompt length x* sets the length:
+  rewrite matches Generate Text word for word, but the pictures pass the vision tower only once. With the built-in
+  guidance the rewrite is always prose (a JSON answer gets one more try for prose). With a connected **System prompt**,
+  that prompt decides the format: prose, or JSON it asks for (checked, then passed on unchanged). Use **json** mode when
+  the prompt must be JSON whatever the model does. *Prompt length x* sets the length:
   - *0* (default) = Auto. There is no length target, as in Generate Text: the model writes as much as the guidance
     asks for, and only *Max tokens* limits it.
   - *1–20* = a word budget, as a multiple of your instruction's word count (at least 20 words). It is a guide, not an
